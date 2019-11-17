@@ -8,6 +8,7 @@ from conans.errors import ConanInvalidConfiguration
 from conans.model import Generator
 from conans.tools import Version
 
+# conan create . 5.13.2@user/testing --keep-source -pr emscripten.profile --build=missing -o qt:with_glib=False -o qt:with_harfbuzz=False -o qt:with_pq=False -o qt:with_odbc=False -o qt:with_pcre2=False -o qt:with_mysql=False -o qt:openssl=False -o qt:opengl="no" -o qt:qtwebglplugin=True -o qt:shared=False -o qt:qtdeclarative=True -o qt:with_sqlite3=True
 
 class qt(Generator):
     @property
@@ -43,6 +44,7 @@ class QtConan(ConanFile):
     _submodules = _getsubmodules()
 
     generators = "pkg_config"
+    version = "5.13.2"
     name = "qt"
     description = "Qt is a cross-platform framework for graphical user interfaces."
     topics = ("conan", "qt", "ui")
@@ -51,7 +53,7 @@ class QtConan(ConanFile):
     license = "LGPL-3.0"
     author = "Bincrafters <bincrafters@gmail.com>"
     exports = ["LICENSE.md", "qtmodules.conf", "*.diff"]
-    settings = "os", "arch", "compiler", "build_type"
+    settings = "os", "arch", "compiler", "build_type", "os_build", "arch_build"
 
     options = dict({
         "shared": [True, False],
@@ -156,6 +158,10 @@ class QtConan(ConanFile):
             self.options.with_icu = False
 
     def configure(self):
+        if self.settings.os == "Emscripten":
+            # https://wiki.qt.io/Qt_for_WebAssembly
+            self.options.shared = False
+
         if self.settings.os != 'Linux':
             self.options.with_glib = False
         #     self.options.with_libiconv = False
@@ -207,15 +213,15 @@ class QtConan(ConanFile):
             raise ConanInvalidConfiguration('Qt without libc++ needs qt:with_doubleconversion. '
                                             'Either enable qt:with_doubleconversion or switch to libc++')
 
-        assert self.version == self._submodules['qtbase']['branch']
+        assert QtConan.version == QtConan._submodules['qtbase']['branch']
 
         def _enablemodule(mod):
             if mod != 'qtbase':
                 setattr(self.options, mod, True)
-            for req in self._submodules[mod]["depends"]:
+            for req in QtConan._submodules[mod]["depends"]:
                 _enablemodule(req)
 
-        for module in self._submodules:
+        for module in QtConan._submodules:
             if module != 'qtbase' and getattr(self.options, module):
                 _enablemodule(module)
 
@@ -260,7 +266,7 @@ class QtConan(ConanFile):
         if self.options.with_libalsa:
             self.requires("libalsa/1.1.9")
         if self.options.GUI:
-            if self.settings.os == "Linux" and not tools.cross_building(self.settings, skip_x64_x86=True):
+            if self.settings.os == "Linux" and not tools.cross_building(self.settings):
                 self.requires("xkbcommon/0.8.4@bincrafters/stable")
 
     def system_requirements(self):
@@ -327,6 +333,9 @@ class QtConan(ConanFile):
             if self.settings.compiler == "apple-clang":
                 return "macx-tvos-clang"
 
+        elif self.settings.os == "Emscripten":
+            return "wasm-emscripten"
+
         elif self.settings.os == "Android":
             return {"clang": "android-clang",
                     "gcc": "android-g++"}.get(str(self.settings.compiler))
@@ -372,8 +381,9 @@ class QtConan(ConanFile):
         return None
 
     def build(self):
+        # https://bugreports.qt.io/browse/QTBUG-71540
         args = ["-confirm-license", "-silent", "-nomake examples", "-nomake tests",
-                "-prefix %s" % self.package_folder]
+                "-prefix %s" % os.path.join(self.build_folder,'qtbase')]
         if self.options.commercial:
             args.append("-commercial")
         else:
@@ -402,9 +412,9 @@ class QtConan(ConanFile):
             args.append("-release")
             args.append("-optimize-size")
 
-        for module in self._submodules:
+        for module in QtConan._submodules:
             if module != 'qtbase' and not getattr(self.options, module) \
-                    and os.path.isdir(os.path.join(self.source_folder, 'qt5', self._submodules[module]['path'])):
+                    and os.path.isdir(os.path.join(self.source_folder, 'qt5', QtConan._submodules[module]['path'])):
                 args.append("-skip " + module)
 
         args.append("--zlib=system")
@@ -538,7 +548,9 @@ class QtConan(ConanFile):
         else:
             xplatform_val = self._xplatform()
             if xplatform_val:
-                if not tools.cross_building(self.settings, skip_x64_x86=True):
+                if (not tools.cross_building(self.settings)) or\
+                        (self.settings.os == self.settings.os_build and\
+                         self.settings.arch_build == "x86_64" and self.settings.arch == "x86"):
                     args += ["-platform %s" % xplatform_val]
                 else:
                     args += ["-xplatform %s" % xplatform_val]
@@ -590,6 +602,11 @@ class QtConan(ConanFile):
         with tools.vcvars(self.settings) if self.settings.compiler == "Visual Studio" else tools.no_op():
             with tools.environment_append({"MAKEFLAGS": "j%d" % tools.cpu_count(), "PKG_CONFIG_PATH": os.getcwd()}):
                 try:
+                    # https://forum.qt.io/topic/90967/you-cannot-configure-qt-separately-within-a-top-level-build
+                    f1 = open("%s/.qmake.stash" % (self.build_folder),"w+")
+                    f1.close()
+                    f2 = open("%s/.qmake.super" % (self.build_folder),"w+")
+                    f2.close()
                     self.run("%s/qt5/configure %s" % (self.source_folder, " ".join(args)))
                 finally:
                     self.output.info(open('config.log', errors='backslashreplace').read())
@@ -600,14 +617,24 @@ class QtConan(ConanFile):
                     make = "mingw32-make"
                 else:
                     make = "make"
-                self.run(make, run_environment=True)
-                self.run("%s install" % make)
+
+                if not tools.cross_building(self.settings):
+                    self.run(make, run_environment=True)
+                    self.run("%s install" % make)
 
         with open('qtbase/bin/qt.conf', 'w') as f:
             f.write('[Paths]\nPrefix = ..')
 
     def package(self):
         self.copy("bin/qt.conf", src="qtbase")
+	
+        if tools.cross_building(self.settings):
+            self.copy("bin/*", src="qtbase")
+            self.copy("src/*", src="qtbase")
+            self.copy("mkspecs/*", src="qtbase")
+
+            self.copy("doc/config/*", src=os.path.join(self.source_folder,'qtbase'))
+            self.copy("doc/global/*", src=self.source_folder)
 
     def package_id(self):
         # Backwards compatibility for cross_compile to not affect package_id
