@@ -365,10 +365,12 @@ class QtConan(ConanFile):
                 installer.install(item)
 
     def source(self):
-        tools.get(**self.conan_data["sources"][self.version])
-        shutil.move("qt-everywhere-src-%s" % self.version, "qt6")
+        source_path = os.path.join(self.source_folder, "qt6")
+        git = tools.Git(folder = source_path)
+        git.clone("git://code.qt.io/qt/qt5.git", self.version)
+        self.run("./init-repository",cwd=source_path)
 
-        tools.replace_in_file(os.path.join("qt6", "CMakeLists.txt"),
+        tools.replace_in_file(os.path.join(source_path, "CMakeLists.txt"),
                               "enable_testing()",
                               "include(${CMAKE_BINARY_DIR}/conanbuildinfo.cmake)\nconan_basic_setup(KEEP_RPATHS)\n"
                                "set(QT_EXTRA_INCLUDEPATHS ${CONAN_INCLUDE_DIRS})\n"
